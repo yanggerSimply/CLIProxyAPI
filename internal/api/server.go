@@ -612,6 +612,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/rate-limit", s.mgmt.PutRateLimit)
 		mgmt.PATCH("/rate-limit", s.mgmt.PatchRateLimit)
 		mgmt.DELETE("/rate-limit", s.mgmt.DeleteRateLimit)
+		mgmt.POST("/rate-limit/test-lark", s.mgmt.TestLarkWebhook)
 
 		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
 		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)

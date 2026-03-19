@@ -1,7 +1,13 @@
 package management
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -107,4 +113,52 @@ func (h *Handler) PatchRateLimit(c *gin.Context) {
 func (h *Handler) DeleteRateLimit(c *gin.Context) {
 	h.cfg.RateLimit = config.RateLimitConfig{}
 	h.persist(c)
+}
+
+// TestLarkWebhook sends a test notification to the configured Lark webhook via the backend.
+func (h *Handler) TestLarkWebhook(c *gin.Context) {
+	rl := h.cfg.RateLimit
+	webhook := strings.TrimSpace(rl.LarkWebhook)
+	if webhook == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "lark-webhook is not configured"})
+		return
+	}
+
+	prefix := strings.TrimSpace(rl.LarkPrefix)
+	title := "✅ CLIProxyAPI 通知测试"
+	if prefix != "" {
+		title = fmt.Sprintf("[%s] %s", prefix, title)
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"msg_type": "interactive",
+		"card": map[string]any{
+			"header": map[string]any{
+				"title":    map[string]string{"tag": "plain_text", "content": title},
+				"template": "green",
+			},
+			"elements": []map[string]any{
+				{"tag": "markdown", "content": "**限流通知已配置成功**\n当触发 RPM/TPM/并发 限流时，你会在这里收到告警。"},
+				{"tag": "note", "elements": []map[string]string{
+					{"tag": "plain_text", "content": time.Now().UTC().Format("2006-01-02 15:04:05 UTC")},
+				}},
+			},
+		},
+	})
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(webhook, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to send: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("webhook returned status %d", resp.StatusCode)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
