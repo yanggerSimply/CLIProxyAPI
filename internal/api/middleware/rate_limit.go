@@ -1,10 +1,13 @@
 package middleware
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +26,8 @@ type RateLimitConfig struct {
 	WarnThreshold float64
 	// Enable exponential backoff: rejected clients receive Retry-After headers with increasing delays.
 	ExponentialBackoff bool
+	// LarkWebhook is the full Lark/Feishu bot webhook URL. Empty means disabled.
+	LarkWebhook string
 }
 
 type rateLimitEntry struct {
@@ -41,6 +46,8 @@ type RateLimiter struct {
 	cfg        atomic.Pointer[RateLimitConfig]
 	entries    sync.Map // string -> *rateLimitEntry
 	usageStats *usage.RequestStatistics
+	larkMu     sync.Mutex
+	larkLast   time.Time
 }
 
 func NewRateLimiter(cfg *RateLimitConfig) *RateLimiter {
@@ -85,6 +92,55 @@ func (rl *RateLimiter) cleanupLoop() {
 	}
 }
 
+func (rl *RateLimiter) sendLarkNotification(title, message string) {
+	cfg := rl.cfg.Load()
+	if cfg == nil {
+		return
+	}
+	webhook := strings.TrimSpace(cfg.LarkWebhook)
+	if webhook == "" {
+		return
+	}
+
+	rl.larkMu.Lock()
+	if time.Since(rl.larkLast) < 30*time.Second {
+		rl.larkMu.Unlock()
+		return
+	}
+	rl.larkLast = time.Now()
+	rl.larkMu.Unlock()
+
+	go func() {
+		payload, _ := json.Marshal(map[string]any{
+			"msg_type": "interactive",
+			"card": map[string]any{
+				"header": map[string]any{
+					"title":    map[string]string{"tag": "plain_text", "content": title},
+					"template": "red",
+				},
+				"elements": []map[string]any{
+					{"tag": "markdown", "content": message},
+					{"tag": "note", "elements": []map[string]string{
+						{"tag": "plain_text", "content": time.Now().UTC().Format("2006-01-02 15:04:05 UTC")},
+					}},
+				},
+			},
+		})
+
+		resp, err := http.Post(webhook, "application/json", bytes.NewReader(payload))
+		if err != nil {
+			log.Warnf("[RateLimit] failed to send Lark notification: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+
+		if resp.StatusCode != http.StatusOK {
+			log.Warnf("[RateLimit] Lark webhook returned status %d", resp.StatusCode)
+		}
+	}()
+}
+
 // Middleware returns a Gin middleware that enforces RPM limits before the request.
 // TPM is tracked after the response completes via RecordTokens.
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
@@ -121,6 +177,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 				entry.mu.Unlock()
 				retryAfter := computeRetryAfter(cfg.ExponentialBackoff, int(hits))
 				log.Warnf("[RateLimit] source=%s RPM limit exceeded: %d/%d, retry-after=%ds", source, currentRPM, cfg.RPM, retryAfter)
+				rl.sendLarkNotification("⚠️ RPM Limit Exceeded", fmt.Sprintf("**Source:** %s\n**RPM:** %d/%d\n**Retry-After:** %ds", source, currentRPM, cfg.RPM, retryAfter))
 				if rl.usageStats != nil {
 					rl.usageStats.RecordRateLimited(source, fmt.Sprintf("rpm_exceeded:%d/%d", currentRPM, cfg.RPM))
 				}
@@ -149,6 +206,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 				entry.mu.Unlock()
 				retryAfter := computeRetryAfter(cfg.ExponentialBackoff, int(hits))
 				log.Warnf("[RateLimit] source=%s TPM limit exceeded: %d/%d, retry-after=%ds", source, currentTPM, cfg.TPM, retryAfter)
+				rl.sendLarkNotification("⚠️ TPM Limit Exceeded", fmt.Sprintf("**Source:** %s\n**TPM:** %d/%d\n**Retry-After:** %ds", source, currentTPM, cfg.TPM, retryAfter))
 				if rl.usageStats != nil {
 					rl.usageStats.RecordRateLimited(source, fmt.Sprintf("tpm_exceeded:%d/%d", currentTPM, cfg.TPM))
 				}

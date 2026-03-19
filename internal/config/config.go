@@ -273,6 +273,8 @@ type RateLimitConfig struct {
 	WarnThreshold float64 `yaml:"warn-threshold" json:"warn-threshold"`
 	// ExponentialBackoff enables increasing Retry-After delays on consecutive rejections.
 	ExponentialBackoff bool `yaml:"exponential-backoff" json:"exponential-backoff"`
+	// LarkWebhook is the full Lark/Feishu bot webhook URL for rate-limit notifications.
+	LarkWebhook string `yaml:"lark-webhook" json:"lark-webhook"`
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.

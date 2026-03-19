@@ -12,6 +12,7 @@ type rateLimitResponse struct {
 	TPM                int     `json:"tpm"`
 	WarnThreshold      float64 `json:"warn-threshold"`
 	ExponentialBackoff bool    `json:"exponential-backoff"`
+	LarkWebhook        string  `json:"lark-webhook"`
 }
 
 type rateLimitUpdateRequest struct {
@@ -19,6 +20,7 @@ type rateLimitUpdateRequest struct {
 	TPM                *int     `json:"tpm"`
 	WarnThreshold      *float64 `json:"warn-threshold"`
 	ExponentialBackoff *bool    `json:"exponential-backoff"`
+	LarkWebhook        *string  `json:"lark-webhook"`
 }
 
 // GetRateLimit returns the current rate-limit configuration.
@@ -30,6 +32,7 @@ func (h *Handler) GetRateLimit(c *gin.Context) {
 			TPM:                rl.TPM,
 			WarnThreshold:      rl.WarnThreshold,
 			ExponentialBackoff: rl.ExponentialBackoff,
+			LarkWebhook:        rl.LarkWebhook,
 		},
 	})
 }
@@ -69,6 +72,9 @@ func (h *Handler) PutRateLimit(c *gin.Context) {
 	}
 	if body.ExponentialBackoff != nil {
 		rl.ExponentialBackoff = *body.ExponentialBackoff
+	}
+	if body.LarkWebhook != nil {
+		rl.LarkWebhook = *body.LarkWebhook
 	}
 
 	h.persist(c)

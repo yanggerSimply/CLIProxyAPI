@@ -240,6 +240,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 			TPM:                cfg.RateLimit.TPM,
 			WarnThreshold:      cfg.RateLimit.WarnThreshold,
 			ExponentialBackoff: cfg.RateLimit.ExponentialBackoff,
+			LarkWebhook:        cfg.RateLimit.LarkWebhook,
 		}
 		rateLimiter = middleware.NewRateLimiter(rlCfg)
 		engine.Use(rateLimiter.Middleware())
@@ -947,6 +948,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			TPM:                cfg.RateLimit.TPM,
 			WarnThreshold:      cfg.RateLimit.WarnThreshold,
 			ExponentialBackoff: cfg.RateLimit.ExponentialBackoff,
+			LarkWebhook:        cfg.RateLimit.LarkWebhook,
 		})
 	}
 
