@@ -10,34 +10,41 @@ import (
 type rateLimitResponse struct {
 	RPM                int     `json:"rpm"`
 	TPM                int     `json:"tpm"`
+	MaxConcurrency     int     `json:"max-concurrency"`
 	WarnThreshold      float64 `json:"warn-threshold"`
 	ExponentialBackoff bool    `json:"exponential-backoff"`
 	LarkWebhook        string  `json:"lark-webhook"`
+	LarkPrefix         string  `json:"lark-prefix"`
+	LarkEvents         string  `json:"lark-events"`
 }
 
 type rateLimitUpdateRequest struct {
 	RPM                *int     `json:"rpm"`
 	TPM                *int     `json:"tpm"`
+	MaxConcurrency     *int     `json:"max-concurrency"`
 	WarnThreshold      *float64 `json:"warn-threshold"`
 	ExponentialBackoff *bool    `json:"exponential-backoff"`
 	LarkWebhook        *string  `json:"lark-webhook"`
+	LarkPrefix         *string  `json:"lark-prefix"`
+	LarkEvents         *string  `json:"lark-events"`
 }
 
-// GetRateLimit returns the current rate-limit configuration.
 func (h *Handler) GetRateLimit(c *gin.Context) {
 	rl := h.cfg.RateLimit
 	c.JSON(http.StatusOK, gin.H{
 		"rate-limit": rateLimitResponse{
 			RPM:                rl.RPM,
 			TPM:                rl.TPM,
+			MaxConcurrency:     rl.MaxConcurrency,
 			WarnThreshold:      rl.WarnThreshold,
 			ExponentialBackoff: rl.ExponentialBackoff,
 			LarkWebhook:        rl.LarkWebhook,
+			LarkPrefix:         rl.LarkPrefix,
+			LarkEvents:         rl.LarkEvents,
 		},
 	})
 }
 
-// PutRateLimit replaces the entire rate-limit configuration.
 func (h *Handler) PutRateLimit(c *gin.Context) {
 	var body rateLimitUpdateRequest
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -60,6 +67,13 @@ func (h *Handler) PutRateLimit(c *gin.Context) {
 		}
 		rl.TPM = v
 	}
+	if body.MaxConcurrency != nil {
+		v := *body.MaxConcurrency
+		if v < 0 {
+			v = 0
+		}
+		rl.MaxConcurrency = v
+	}
 	if body.WarnThreshold != nil {
 		v := *body.WarnThreshold
 		if v < 0 {
@@ -76,16 +90,20 @@ func (h *Handler) PutRateLimit(c *gin.Context) {
 	if body.LarkWebhook != nil {
 		rl.LarkWebhook = *body.LarkWebhook
 	}
+	if body.LarkPrefix != nil {
+		rl.LarkPrefix = *body.LarkPrefix
+	}
+	if body.LarkEvents != nil {
+		rl.LarkEvents = *body.LarkEvents
+	}
 
 	h.persist(c)
 }
 
-// PatchRateLimit is an alias for PutRateLimit (partial update).
 func (h *Handler) PatchRateLimit(c *gin.Context) {
 	h.PutRateLimit(c)
 }
 
-// DeleteRateLimit resets rate-limit configuration to defaults (disabled).
 func (h *Handler) DeleteRateLimit(c *gin.Context) {
 	h.cfg.RateLimit = config.RateLimitConfig{}
 	h.persist(c)

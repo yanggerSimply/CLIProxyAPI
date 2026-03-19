@@ -234,13 +234,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Initialize rate limiter if configured.
 	var rateLimiter *middleware.RateLimiter
-	if cfg.RateLimit.RPM > 0 || cfg.RateLimit.TPM > 0 {
+	if cfg.RateLimit.RPM > 0 || cfg.RateLimit.TPM > 0 || cfg.RateLimit.MaxConcurrency > 0 {
 		rlCfg := &middleware.RateLimitConfig{
 			RPM:                cfg.RateLimit.RPM,
 			TPM:                cfg.RateLimit.TPM,
+			MaxConcurrency:     cfg.RateLimit.MaxConcurrency,
 			WarnThreshold:      cfg.RateLimit.WarnThreshold,
 			ExponentialBackoff: cfg.RateLimit.ExponentialBackoff,
 			LarkWebhook:        cfg.RateLimit.LarkWebhook,
+			LarkPrefix:         cfg.RateLimit.LarkPrefix,
+			LarkEvents:         cfg.RateLimit.LarkEvents,
 		}
 		rateLimiter = middleware.NewRateLimiter(rlCfg)
 		engine.Use(rateLimiter.Middleware())
@@ -946,9 +949,12 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.rateLimiter.UpdateConfig(&middleware.RateLimitConfig{
 			RPM:                cfg.RateLimit.RPM,
 			TPM:                cfg.RateLimit.TPM,
+			MaxConcurrency:     cfg.RateLimit.MaxConcurrency,
 			WarnThreshold:      cfg.RateLimit.WarnThreshold,
 			ExponentialBackoff: cfg.RateLimit.ExponentialBackoff,
 			LarkWebhook:        cfg.RateLimit.LarkWebhook,
+			LarkPrefix:         cfg.RateLimit.LarkPrefix,
+			LarkEvents:         cfg.RateLimit.LarkEvents,
 		})
 	}
 

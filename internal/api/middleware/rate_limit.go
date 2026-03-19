@@ -18,16 +18,14 @@ import (
 )
 
 type RateLimitConfig struct {
-	// Max requests per minute per source (0 = unlimited)
-	RPM int
-	// Max tokens per minute per source (0 = unlimited)
-	TPM int
-	// Warning threshold as a fraction (0.0-1.0). Emit a warning log when usage exceeds this fraction of the limit.
-	WarnThreshold float64
-	// Enable exponential backoff: rejected clients receive Retry-After headers with increasing delays.
+	RPM                int
+	TPM                int
+	MaxConcurrency     int
+	WarnThreshold      float64
 	ExponentialBackoff bool
-	// LarkWebhook is the full Lark/Feishu bot webhook URL. Empty means disabled.
-	LarkWebhook string
+	LarkWebhook        string
+	LarkPrefix         string
+	LarkEvents         string
 }
 
 type rateLimitEntry struct {
@@ -35,6 +33,7 @@ type rateLimitEntry struct {
 	requestTimes   []time.Time
 	tokenCounts    []tokenRecord
 	consecutiveHit int32
+	inflight       int32
 }
 
 type tokenRecord struct {
@@ -44,15 +43,16 @@ type tokenRecord struct {
 
 type RateLimiter struct {
 	cfg        atomic.Pointer[RateLimitConfig]
-	entries    sync.Map // string -> *rateLimitEntry
+	entries    sync.Map
 	usageStats *usage.RequestStatistics
 	larkMu     sync.Mutex
-	larkLast   time.Time
+	larkLast   map[string]time.Time
 }
 
 func NewRateLimiter(cfg *RateLimitConfig) *RateLimiter {
 	rl := &RateLimiter{
 		usageStats: usage.GetRequestStatistics(),
+		larkLast:   make(map[string]time.Time),
 	}
 	rl.cfg.Store(cfg)
 	go rl.cleanupLoop()
@@ -82,7 +82,7 @@ func (rl *RateLimiter) cleanupLoop() {
 			entry.mu.Lock()
 			entry.requestTimes = pruneTimestamps(entry.requestTimes, cutoff)
 			entry.tokenCounts = pruneTokenRecords(entry.tokenCounts, cutoff)
-			empty := len(entry.requestTimes) == 0 && len(entry.tokenCounts) == 0
+			empty := len(entry.requestTimes) == 0 && len(entry.tokenCounts) == 0 && atomic.LoadInt32(&entry.inflight) == 0
 			entry.mu.Unlock()
 			if empty {
 				rl.entries.Delete(key)
@@ -92,7 +92,27 @@ func (rl *RateLimiter) cleanupLoop() {
 	}
 }
 
-func (rl *RateLimiter) sendLarkNotification(title, message string) {
+func (rl *RateLimiter) larkEnabled(event string) bool {
+	cfg := rl.cfg.Load()
+	if cfg == nil || strings.TrimSpace(cfg.LarkWebhook) == "" {
+		return false
+	}
+	events := strings.TrimSpace(cfg.LarkEvents)
+	if events == "" {
+		events = "exceeded"
+	}
+	for _, e := range strings.Split(events, ",") {
+		if strings.TrimSpace(e) == event {
+			return true
+		}
+	}
+	return false
+}
+
+func (rl *RateLimiter) sendLarkNotification(event, title, message string) {
+	if !rl.larkEnabled(event) {
+		return
+	}
 	cfg := rl.cfg.Load()
 	if cfg == nil {
 		return
@@ -103,19 +123,25 @@ func (rl *RateLimiter) sendLarkNotification(title, message string) {
 	}
 
 	rl.larkMu.Lock()
-	if time.Since(rl.larkLast) < 30*time.Second {
+	if last, ok := rl.larkLast[event]; ok && time.Since(last) < 30*time.Second {
 		rl.larkMu.Unlock()
 		return
 	}
-	rl.larkLast = time.Now()
+	rl.larkLast[event] = time.Now()
 	rl.larkMu.Unlock()
+
+	prefix := strings.TrimSpace(cfg.LarkPrefix)
+	fullTitle := title
+	if prefix != "" {
+		fullTitle = fmt.Sprintf("[%s] %s", prefix, title)
+	}
 
 	go func() {
 		payload, _ := json.Marshal(map[string]any{
 			"msg_type": "interactive",
 			"card": map[string]any{
 				"header": map[string]any{
-					"title":    map[string]string{"tag": "plain_text", "content": title},
+					"title":    map[string]string{"tag": "plain_text", "content": fullTitle},
 					"template": "red",
 				},
 				"elements": []map[string]any{
@@ -141,12 +167,10 @@ func (rl *RateLimiter) sendLarkNotification(title, message string) {
 	}()
 }
 
-// Middleware returns a Gin middleware that enforces RPM limits before the request.
-// TPM is tracked after the response completes via RecordTokens.
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cfg := rl.cfg.Load()
-		if cfg == nil || (cfg.RPM <= 0 && cfg.TPM <= 0) {
+		if cfg == nil || (cfg.RPM <= 0 && cfg.TPM <= 0 && cfg.MaxConcurrency <= 0) {
 			c.Next()
 			return
 		}
@@ -155,6 +179,24 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 		entry := rl.getEntry(source)
 		now := time.Now()
 		windowStart := now.Add(-time.Minute)
+
+		// --- Concurrency check (lock-free) ---
+		if cfg.MaxConcurrency > 0 {
+			current := atomic.AddInt32(&entry.inflight, 1)
+			if int(current) > cfg.MaxConcurrency {
+				atomic.AddInt32(&entry.inflight, -1)
+				hits := atomic.AddInt32(&entry.consecutiveHit, 1)
+				retryAfter := computeRetryAfter(cfg.ExponentialBackoff, int(hits))
+				log.Warnf("[RateLimit] source=%s concurrency limit exceeded: %d/%d, retry-after=%ds", source, current, cfg.MaxConcurrency, retryAfter)
+				rl.sendLarkNotification("exceeded", "⚠️ Concurrency Limit Exceeded", fmt.Sprintf("**Source:** %s\n**Concurrent:** %d/%d\n**Retry-After:** %ds", source, current, cfg.MaxConcurrency, retryAfter))
+				if rl.usageStats != nil {
+					rl.usageStats.RecordRateLimited(source, fmt.Sprintf("concurrency_exceeded:%d/%d", current, cfg.MaxConcurrency))
+				}
+				rejectRequest(c, 0, 0, retryAfter)
+				return
+			}
+			defer atomic.AddInt32(&entry.inflight, -1)
+		}
 
 		entry.mu.Lock()
 
@@ -170,6 +212,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			warnAt := int(math.Ceil(float64(cfg.RPM) * warnThreshold))
 			if currentRPM >= warnAt && currentRPM < cfg.RPM {
 				log.Warnf("[RateLimit] source=%s RPM approaching limit: %d/%d", source, currentRPM, cfg.RPM)
+				rl.sendLarkNotification("warning", "⚡ RPM Approaching Limit", fmt.Sprintf("**Source:** %s\n**RPM:** %d/%d", source, currentRPM, cfg.RPM))
 			}
 
 			if currentRPM >= cfg.RPM {
@@ -177,7 +220,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 				entry.mu.Unlock()
 				retryAfter := computeRetryAfter(cfg.ExponentialBackoff, int(hits))
 				log.Warnf("[RateLimit] source=%s RPM limit exceeded: %d/%d, retry-after=%ds", source, currentRPM, cfg.RPM, retryAfter)
-				rl.sendLarkNotification("⚠️ RPM Limit Exceeded", fmt.Sprintf("**Source:** %s\n**RPM:** %d/%d\n**Retry-After:** %ds", source, currentRPM, cfg.RPM, retryAfter))
+				rl.sendLarkNotification("exceeded", "⚠️ RPM Limit Exceeded", fmt.Sprintf("**Source:** %s\n**RPM:** %d/%d\n**Retry-After:** %ds", source, currentRPM, cfg.RPM, retryAfter))
 				if rl.usageStats != nil {
 					rl.usageStats.RecordRateLimited(source, fmt.Sprintf("rpm_exceeded:%d/%d", currentRPM, cfg.RPM))
 				}
@@ -188,7 +231,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			entry.requestTimes = append(entry.requestTimes, now)
 		}
 
-		// --- TPM warning (pre-request, based on existing window) ---
+		// --- TPM warning ---
 		if cfg.TPM > 0 {
 			entry.tokenCounts = pruneTokenRecords(entry.tokenCounts, windowStart)
 			currentTPM := sumTokens(entry.tokenCounts)
@@ -199,6 +242,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			warnAt := int(math.Ceil(float64(cfg.TPM) * warnThreshold))
 			if currentTPM >= warnAt && currentTPM < cfg.TPM {
 				log.Warnf("[RateLimit] source=%s TPM approaching limit: %d/%d", source, currentTPM, cfg.TPM)
+				rl.sendLarkNotification("warning", "⚡ TPM Approaching Limit", fmt.Sprintf("**Source:** %s\n**TPM:** %d/%d", source, currentTPM, cfg.TPM))
 			}
 
 			if currentTPM >= cfg.TPM {
@@ -206,7 +250,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 				entry.mu.Unlock()
 				retryAfter := computeRetryAfter(cfg.ExponentialBackoff, int(hits))
 				log.Warnf("[RateLimit] source=%s TPM limit exceeded: %d/%d, retry-after=%ds", source, currentTPM, cfg.TPM, retryAfter)
-				rl.sendLarkNotification("⚠️ TPM Limit Exceeded", fmt.Sprintf("**Source:** %s\n**TPM:** %d/%d\n**Retry-After:** %ds", source, currentTPM, cfg.TPM, retryAfter))
+				rl.sendLarkNotification("exceeded", "⚠️ TPM Limit Exceeded", fmt.Sprintf("**Source:** %s\n**TPM:** %d/%d\n**Retry-After:** %ds", source, currentTPM, cfg.TPM, retryAfter))
 				if rl.usageStats != nil {
 					rl.usageStats.RecordRateLimited(source, fmt.Sprintf("tpm_exceeded:%d/%d", currentTPM, cfg.TPM))
 				}
@@ -222,8 +266,6 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	}
 }
 
-// RecordTokens records token usage after a successful response.
-// Call this from the response logging middleware or handler completion.
 func (rl *RateLimiter) RecordTokens(source string, tokens int) {
 	if tokens <= 0 {
 		return
@@ -239,8 +281,6 @@ func (rl *RateLimiter) RecordTokens(source string, tokens int) {
 	entry.mu.Unlock()
 }
 
-// TokenTrackingMiddleware returns a Gin middleware that estimates and records token usage
-// from the response body size when exact token counts aren't available.
 func (rl *RateLimiter) TokenTrackingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Next()
@@ -259,7 +299,6 @@ func (rl *RateLimiter) TokenTrackingMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Rough estimation: ~4 chars per token for English, response body bytes / 4
 		estimatedTokens := bytesWritten / 4
 		if estimatedTokens < 1 {
 			estimatedTokens = 1
@@ -283,7 +322,7 @@ func computeRetryAfter(exponential bool, consecutiveHits int) int {
 	if !exponential || consecutiveHits <= 1 {
 		return 2
 	}
-	delay := 1 << min(consecutiveHits, 8) // 2, 4, 8, 16 ... 256s max
+	delay := 1 << min(consecutiveHits, 8)
 	if delay > 256 {
 		delay = 256
 	}

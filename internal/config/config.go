@@ -269,12 +269,19 @@ type RateLimitConfig struct {
 	RPM int `yaml:"rpm" json:"rpm"`
 	// TPM is the maximum (estimated) tokens per minute per source. 0 means unlimited.
 	TPM int `yaml:"tpm" json:"tpm"`
+	// MaxConcurrency is the maximum number of concurrent in-flight requests per source. 0 means unlimited.
+	MaxConcurrency int `yaml:"max-concurrency" json:"max-concurrency"`
 	// WarnThreshold is a fraction (0.0-1.0) at which a warning log is emitted. Default 0.8.
 	WarnThreshold float64 `yaml:"warn-threshold" json:"warn-threshold"`
 	// ExponentialBackoff enables increasing Retry-After delays on consecutive rejections.
 	ExponentialBackoff bool `yaml:"exponential-backoff" json:"exponential-backoff"`
 	// LarkWebhook is the full Lark/Feishu bot webhook URL for rate-limit notifications.
 	LarkWebhook string `yaml:"lark-webhook" json:"lark-webhook"`
+	// LarkPrefix is prepended to all Lark notification titles for multi-server identification.
+	LarkPrefix string `yaml:"lark-prefix" json:"lark-prefix"`
+	// LarkEvents controls which events trigger Lark notifications. Comma-separated list.
+	// Supported: "exceeded" (limit exceeded), "warning" (approaching threshold). Default: "exceeded".
+	LarkEvents string `yaml:"lark-events" json:"lark-events"`
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
