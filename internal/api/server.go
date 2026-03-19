@@ -158,6 +158,9 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
+	// rateLimiter enforces per-source RPM/TPM limits.
+	rateLimiter *middleware.RateLimiter
+
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
 
@@ -229,6 +232,24 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		}
 	}
 
+	// Initialize rate limiter if configured.
+	var rateLimiter *middleware.RateLimiter
+	if cfg.RateLimit.RPM > 0 || cfg.RateLimit.TPM > 0 {
+		rlCfg := &middleware.RateLimitConfig{
+			RPM:                cfg.RateLimit.RPM,
+			TPM:                cfg.RateLimit.TPM,
+			WarnThreshold:      cfg.RateLimit.WarnThreshold,
+			ExponentialBackoff: cfg.RateLimit.ExponentialBackoff,
+		}
+		rateLimiter = middleware.NewRateLimiter(rlCfg)
+		engine.Use(rateLimiter.Middleware())
+		if cfg.RateLimit.TPM > 0 {
+			engine.Use(rateLimiter.TokenTrackingMiddleware())
+		}
+		log.Infof("Rate limiting enabled: RPM=%d, TPM=%d, warn=%.0f%%, backoff=%v",
+			cfg.RateLimit.RPM, cfg.RateLimit.TPM, cfg.RateLimit.WarnThreshold*100, cfg.RateLimit.ExponentialBackoff)
+	}
+
 	engine.Use(corsMiddleware())
 	wd, err := os.Getwd()
 	if err != nil {
@@ -251,6 +272,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
+		rateLimiter:         rateLimiter,
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
@@ -582,6 +604,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
 		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
 
+		mgmt.GET("/rate-limit", s.mgmt.GetRateLimit)
+		mgmt.PUT("/rate-limit", s.mgmt.PutRateLimit)
+		mgmt.PATCH("/rate-limit", s.mgmt.PatchRateLimit)
+		mgmt.DELETE("/rate-limit", s.mgmt.DeleteRateLimit)
+
 		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
 		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
 		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
@@ -912,6 +939,15 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	}
+
+	if s.rateLimiter != nil {
+		s.rateLimiter.UpdateConfig(&middleware.RateLimitConfig{
+			RPM:                cfg.RateLimit.RPM,
+			TPM:                cfg.RateLimit.TPM,
+			WarnThreshold:      cfg.RateLimit.WarnThreshold,
+			ExponentialBackoff: cfg.RateLimit.ExponentialBackoff,
+		})
 	}
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {

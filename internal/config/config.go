@@ -122,6 +122,9 @@ type Config struct {
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
+	// RateLimit configures per-source request and token rate limiting to prevent abuse detection.
+	RateLimit RateLimitConfig `yaml:"rate-limit" json:"rate-limit"`
+
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
@@ -258,6 +261,18 @@ type AmpUpstreamAPIKeyEntry struct {
 
 	// APIKeys are the client API keys (from top-level api-keys) that map to this upstream key.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+}
+
+// RateLimitConfig controls per-source rate limiting to avoid triggering upstream abuse detection.
+type RateLimitConfig struct {
+	// RPM is the maximum requests per minute per source. 0 means unlimited.
+	RPM int `yaml:"rpm" json:"rpm"`
+	// TPM is the maximum (estimated) tokens per minute per source. 0 means unlimited.
+	TPM int `yaml:"tpm" json:"tpm"`
+	// WarnThreshold is a fraction (0.0-1.0) at which a warning log is emitted. Default 0.8.
+	WarnThreshold float64 `yaml:"warn-threshold" json:"warn-threshold"`
+	// ExponentialBackoff enables increasing Retry-After delays on consecutive rejections.
+	ExponentialBackoff bool `yaml:"exponential-backoff" json:"exponential-backoff"`
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.

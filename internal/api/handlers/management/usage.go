@@ -27,8 +27,9 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 		snapshot = h.usageStats.Snapshot()
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"usage":           snapshot,
-		"failed_requests": snapshot.FailureCount,
+		"usage":                snapshot,
+		"failed_requests":      snapshot.FailureCount,
+		"rate_limited_requests": snapshot.RateLimitedCount,
 	})
 }
 

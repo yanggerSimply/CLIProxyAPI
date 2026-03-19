@@ -60,10 +60,11 @@ func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 type RequestStatistics struct {
 	mu sync.RWMutex
 
-	totalRequests int64
-	successCount  int64
-	failureCount  int64
-	totalTokens   int64
+	totalRequests    int64
+	successCount     int64
+	failureCount     int64
+	rateLimitedCount int64
+	totalTokens      int64
 
 	apis map[string]*apiStats
 
@@ -89,11 +90,17 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp and token usage for a single request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	Source    string     `json:"source"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp   time.Time  `json:"timestamp"`
+	Source      string     `json:"source"`
+	AuthIndex   string     `json:"auth_index"`
+	Tokens      TokenStats `json:"tokens"`
+	Failed      bool       `json:"failed"`
+	Provider    string     `json:"provider,omitempty"`
+	Path        string     `json:"path,omitempty"`
+	StatusCode  int        `json:"status_code,omitempty"`
+	LatencyMs   int64      `json:"latency_ms,omitempty"`
+	RateLimited bool       `json:"rate_limited,omitempty"`
+	ErrorType   string     `json:"error_type,omitempty"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -107,10 +114,11 @@ type TokenStats struct {
 
 // StatisticsSnapshot represents an immutable view of the aggregated metrics.
 type StatisticsSnapshot struct {
-	TotalRequests int64 `json:"total_requests"`
-	SuccessCount  int64 `json:"success_count"`
-	FailureCount  int64 `json:"failure_count"`
-	TotalTokens   int64 `json:"total_tokens"`
+	TotalRequests    int64 `json:"total_requests"`
+	SuccessCount     int64 `json:"success_count"`
+	FailureCount     int64 `json:"failure_count"`
+	RateLimitedCount int64 `json:"rate_limited_count"`
+	TotalTokens      int64 `json:"total_tokens"`
 
 	APIs map[string]APISnapshot `json:"apis"`
 
@@ -169,6 +177,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		statsKey = resolveAPIIdentifier(ctx, record)
 	}
 	failed := record.Failed
+	statusCode := 0
 	if !failed {
 		failed = !resolveSuccess(ctx)
 	}
@@ -177,6 +186,23 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if modelName == "" {
 		modelName = "unknown"
 	}
+
+	var path string
+	var errorType string
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+			statusCode = ginCtx.Writer.Status()
+			if ginCtx.Request != nil {
+				path = ginCtx.Request.Method + " " + ginCtx.Request.URL.Path
+			}
+			if failed && statusCode >= 400 {
+				errorType = classifyErrorType(statusCode)
+			}
+		}
+	}
+
+	latencyMs := time.Since(timestamp).Milliseconds()
+
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 
@@ -197,17 +223,80 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp: timestamp,
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Tokens:    detail,
-		Failed:    failed,
+		Timestamp:  timestamp,
+		Source:     record.Source,
+		AuthIndex:  record.AuthIndex,
+		Tokens:     detail,
+		Failed:     failed,
+		Provider:   record.Provider,
+		Path:       path,
+		StatusCode: statusCode,
+		LatencyMs:  latencyMs,
+		ErrorType:  errorType,
 	})
 
 	s.requestsByDay[dayKey]++
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+}
+
+// RecordRateLimited records a rate-limited request that was rejected before reaching upstream.
+func (s *RequestStatistics) RecordRateLimited(source, reason string) {
+	if s == nil {
+		return
+	}
+	if !statisticsEnabled.Load() {
+		return
+	}
+	now := time.Now()
+	dayKey := now.Format("2006-01-02")
+	hourKey := now.Hour()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.totalRequests++
+	s.failureCount++
+	s.rateLimitedCount++
+
+	statsKey := "rate_limited"
+	stats, ok := s.apis[statsKey]
+	if !ok {
+		stats = &apiStats{Models: make(map[string]*modelStats)}
+		s.apis[statsKey] = stats
+	}
+	s.updateAPIStats(stats, "rate_limited", RequestDetail{
+		Timestamp:   now,
+		Source:      source,
+		Failed:      true,
+		RateLimited: true,
+		StatusCode:  429,
+		ErrorType:   reason,
+	})
+
+	s.requestsByDay[dayKey]++
+	s.requestsByHour[hourKey]++
+}
+
+func classifyErrorType(statusCode int) string {
+	switch statusCode {
+	case 400:
+		return "bad_request"
+	case 401:
+		return "authentication_error"
+	case 403:
+		return "permission_error"
+	case 404:
+		return "not_found"
+	case 429:
+		return "rate_limit_error"
+	default:
+		if statusCode >= 500 {
+			return "server_error"
+		}
+		return fmt.Sprintf("http_%d", statusCode)
+	}
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
@@ -236,6 +325,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	result.TotalRequests = s.totalRequests
 	result.SuccessCount = s.successCount
 	result.FailureCount = s.failureCount
+	result.RateLimitedCount = s.rateLimitedCount
 	result.TotalTokens = s.totalTokens
 
 	result.APIs = make(map[string]APISnapshot, len(s.apis))
