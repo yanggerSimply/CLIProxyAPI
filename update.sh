@@ -153,10 +153,16 @@ patch_config_panel_repo() {
   [[ -f "$config" ]] || return
 
   if grep -q 'panel-github-repository' "$config"; then
-    sed -i.bak "s|panel-github-repository:.*|panel-github-repository: \"\"|" "$config"
+    sed -i.bak 's|panel-github-repository:.*|panel-github-repository: "local"|' "$config"
     rm -f "$config.bak"
-    info "Disabled auto-download of official WebUI (using local build)"
+  else
+    # Insert under remote-management section if it exists
+    if grep -q 'remote-management' "$config"; then
+      sed -i.bak '/remote-management:/a\  panel-github-repository: "local"' "$config"
+      rm -f "$config.bak"
+    fi
   fi
+  info "Set panel-github-repository to 'local' (skip remote WebUI download)"
 }
 
 # ─── Create / update systemd service ─────────────────────────────────────────

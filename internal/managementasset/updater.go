@@ -174,6 +174,8 @@ func FilePath(configFilePath string) string {
 
 // EnsureLatestManagementHTML checks the latest management.html asset and updates the local copy when needed.
 // It coalesces concurrent sync attempts and returns whether the asset exists after the sync attempt.
+// When panelRepository is set to "local" or "none", remote sync is skipped entirely so that
+// a locally built management.html is never overwritten by the upstream release.
 func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string) bool {
 	if ctx == nil {
 		ctx = context.Background()
@@ -185,6 +187,17 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return false
 	}
 	localPath := filepath.Join(staticDir, managementAssetName)
+
+	trimmedRepo := strings.ToLower(strings.TrimSpace(panelRepository))
+	if trimmedRepo == "local" || trimmedRepo == "none" {
+		_, err := os.Stat(localPath)
+		if err == nil {
+			log.Debug("management asset sync skipped: panel-github-repository set to local/none, using existing file")
+		} else {
+			log.Warn("management asset sync skipped: panel-github-repository set to local/none but file does not exist")
+		}
+		return err == nil
+	}
 
 	_, _, _ = sfGroup.Do(localPath, func() (interface{}, error) {
 		lastUpdateCheckMu.Lock()
