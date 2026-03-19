@@ -47,6 +47,8 @@ type RateLimiter struct {
 	usageStats *usage.RequestStatistics
 	larkMu     sync.Mutex
 	larkLast   map[string]time.Time
+	peakRPM    atomic.Int32
+	peakConc   atomic.Int32
 }
 
 func NewRateLimiter(cfg *RateLimitConfig) *RateLimiter {
@@ -56,6 +58,7 @@ func NewRateLimiter(cfg *RateLimitConfig) *RateLimiter {
 	}
 	rl.cfg.Store(cfg)
 	go rl.cleanupLoop()
+	go rl.dailySummaryLoop()
 	return rl
 }
 
@@ -90,6 +93,149 @@ func (rl *RateLimiter) cleanupLoop() {
 			return true
 		})
 	}
+}
+
+func (rl *RateLimiter) dailySummaryLoop() {
+	now := time.Now()
+	nextRun := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	time.Sleep(time.Until(nextRun))
+
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	rl.sendDailySummary()
+	for range ticker.C {
+		rl.sendDailySummary()
+	}
+}
+
+func (rl *RateLimiter) sendDailySummary() {
+	cfg := rl.cfg.Load()
+	if cfg == nil || strings.TrimSpace(cfg.LarkWebhook) == "" {
+		return
+	}
+	if !rl.larkEnabled("daily") && !rl.larkEnabled("exceeded") {
+		return
+	}
+
+	snap := rl.usageStats.Snapshot()
+	peakRPM := rl.peakRPM.Swap(0)
+	peakConc := rl.peakConc.Swap(0)
+
+	successRate := float64(0)
+	if snap.TotalRequests > 0 {
+		successRate = float64(snap.SuccessCount) / float64(snap.TotalRequests) * 100
+	}
+
+	// Calculate recommended next-tier values
+	recRPM, recTPM, recConc := rl.recommendNextTier(cfg, peakRPM, peakConc, snap)
+
+	prefix := strings.TrimSpace(cfg.LarkPrefix)
+	title := "📊 Daily Rate Limit Summary"
+	if prefix != "" {
+		title = fmt.Sprintf("[%s] %s", prefix, title)
+	}
+
+	yesterday := time.Now().Add(-24 * time.Hour).Format("2006-01-02")
+
+	body := fmt.Sprintf(
+		"**Date:** %s\n"+
+			"**Total Requests:** %d\n"+
+			"**Success:** %d (%.1f%%)\n"+
+			"**Failed:** %d\n"+
+			"**Rate Limited:** %d\n"+
+			"**Total Tokens:** %d\n"+
+			"---\n"+
+			"**Peak RPM:** %d / %d\n"+
+			"**Peak Concurrency:** %d / %d\n"+
+			"---\n"+
+			"**🎯 Recommended Next Tier:**\n"+
+			"RPM: %d → **%d**\n"+
+			"TPM: %d → **%d**\n"+
+			"MaxConcurrency: %d → **%d**\n"+
+			"---\n"+
+			"_If no rate-limited requests occurred and peak usage < 60%% of limits, consider raising limits gradually._",
+		yesterday,
+		snap.TotalRequests, snap.SuccessCount, successRate,
+		snap.FailureCount, snap.RateLimitedCount, snap.TotalTokens,
+		peakRPM, cfg.RPM, peakConc, cfg.MaxConcurrency,
+		cfg.RPM, recRPM, cfg.TPM, recTPM, cfg.MaxConcurrency, recConc,
+	)
+
+	webhook := strings.TrimSpace(cfg.LarkWebhook)
+	go func() {
+		payload, _ := json.Marshal(map[string]any{
+			"msg_type": "interactive",
+			"card": map[string]any{
+				"header": map[string]any{
+					"title":    map[string]string{"tag": "plain_text", "content": title},
+					"template": "blue",
+				},
+				"elements": []map[string]any{
+					{"tag": "markdown", "content": body},
+					{"tag": "note", "elements": []map[string]string{
+						{"tag": "plain_text", "content": time.Now().UTC().Format("2006-01-02 15:04:05 UTC")},
+					}},
+				},
+			},
+		})
+
+		resp, err := http.Post(webhook, "application/json", bytes.NewReader(payload))
+		if err != nil {
+			log.Warnf("[RateLimit] failed to send daily summary: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+	}()
+
+	log.Info("[RateLimit] daily summary sent to Lark")
+}
+
+func (rl *RateLimiter) recommendNextTier(cfg *RateLimitConfig, peakRPM, peakConc int32, snap usage.StatisticsSnapshot) (rpm, tpm, conc int) {
+	rpm = cfg.RPM
+	tpm = cfg.TPM
+	conc = cfg.MaxConcurrency
+
+	if snap.RateLimitedCount > 0 {
+		// Got rate-limited: don't increase, maybe stay or decrease
+		return
+	}
+
+	// Safe zone: peak < 60% of limit → suggest +25% increase
+	// Moderate zone: peak 60-85% → suggest +10% increase
+	// Hot zone: peak > 85% → keep current
+	bump := func(current int, peak int32) int {
+		if current <= 0 {
+			return current
+		}
+		ratio := float64(peak) / float64(current)
+		switch {
+		case ratio < 0.6:
+			return int(math.Ceil(float64(current) * 1.25))
+		case ratio < 0.85:
+			return int(math.Ceil(float64(current) * 1.10))
+		default:
+			return current
+		}
+	}
+
+	rpm = bump(cfg.RPM, peakRPM)
+	conc = bump(cfg.MaxConcurrency, peakConc)
+
+	// TPM: estimate from total tokens
+	if cfg.TPM > 0 && snap.TotalRequests > 0 {
+		avgTokensPerMin := float64(snap.TotalTokens) / (24 * 60)
+		tpmRatio := avgTokensPerMin / float64(cfg.TPM)
+		switch {
+		case tpmRatio < 0.6:
+			tpm = int(math.Ceil(float64(cfg.TPM) * 1.25))
+		case tpmRatio < 0.85:
+			tpm = int(math.Ceil(float64(cfg.TPM) * 1.10))
+		}
+	}
+
+	return
 }
 
 func (rl *RateLimiter) larkEnabled(event string) bool {
@@ -190,6 +336,12 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 		// --- Concurrency check (lock-free) ---
 		if cfg.MaxConcurrency > 0 {
 			current := atomic.AddInt32(&entry.inflight, 1)
+			for {
+				old := rl.peakConc.Load()
+				if current <= old || rl.peakConc.CompareAndSwap(old, current) {
+					break
+				}
+			}
 			if int(current) > cfg.MaxConcurrency {
 				atomic.AddInt32(&entry.inflight, -1)
 				hits := atomic.AddInt32(&entry.consecutiveHit, 1)
@@ -211,6 +363,14 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 		if cfg.RPM > 0 {
 			entry.requestTimes = pruneTimestamps(entry.requestTimes, windowStart)
 			currentRPM := len(entry.requestTimes)
+			if rpm32 := int32(currentRPM); rpm32 > 0 {
+				for {
+					old := rl.peakRPM.Load()
+					if rpm32 <= old || rl.peakRPM.CompareAndSwap(old, rpm32) {
+						break
+					}
+				}
+			}
 
 			warnThreshold := cfg.WarnThreshold
 			if warnThreshold <= 0 {
