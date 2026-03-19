@@ -175,6 +175,13 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			return
 		}
 
+		// Skip rate limiting for management/control-panel endpoints
+		path := c.Request.URL.Path
+		if strings.HasPrefix(path, "/v0/management") || path == "/management.html" {
+			c.Next()
+			return
+		}
+
 		source := rateLimitSource(c)
 		entry := rl.getEntry(source)
 		now := time.Now()
